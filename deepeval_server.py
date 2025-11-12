@@ -49,12 +49,19 @@ app.add_middleware(
 
 
 class EvalRequest(BaseModel):
-    """Request body for evaluation"""
-    source: str  # context or prompt
-    output: str  # model response
-    provider: Optional[str] = None  # LLM provider: 'openai'
+    """Request body for evaluation
+    
+    TODO(copilot): Refactor request model to separate user query, retrieved context, and model output.
+    We currently use "source" for both prompt and context, which makes faithfulness weaker.
+    Add fields: `query: Optional[str]`, `context: Optional[List[str]]` and keep `output: str` as-is.
+    """
+    # New structure to properly separate concerns:
+    query: Optional[str] = None  # what the user asked
+    context: Optional[List[str]] = None  # list of retrieved docs or source passages
+    output: str  # model's answer to be evaluated
+    provider: Optional[str] = None  # LLM provider: 'groq' or 'openai'
     metric: Optional[str] = "faithfulness"  # metric to evaluate: 'faithfulness', 'answer_relevancy', 'contextual_precision', 'contextual_recall'
-    expected_output: Optional[str] = None  # expected/reference output for comparison (required for some metrics)
+    expected_output: Optional[str] = None  # required for contextual_* metrics
 
 
 class EvalResponse(BaseModel):
@@ -199,24 +206,39 @@ class MetricEvaluator:
         """Validate if the requested metric is supported."""
         return metric_name.lower() in self.SUPPORTED_METRICS
     
-    def create_test_case(self, source: str, output: str, query: Optional[str] = None, expected_output: Optional[str] = None):
-        """Create a standardized test case for evaluation."""
+    def create_test_case(
+        self,
+        query: Optional[str],
+        context: Optional[List[str]],
+        output: str,
+        expected_output: Optional[str]
+    ):
+        """Create a standardized test case for evaluation.
+        
+        TODO(copilot): In the test case builder, DO NOT auto-set expected_output = output.
+        This was making some metrics always pass. Keep it None unless provided.
+        """
         from deepeval.test_case import LLMTestCase
         
-        # For metrics that require expected_output but don't have one provided,
-        # use the actual output as a reference point
-        if expected_output is None:
-            expected_output = output
+        # Ensure context is always a list for deepeval
+        # DeepEval handles empty list properly, no need for [""] fallback
+        retrieval_ctx = context or []
         
         return LLMTestCase(
-            input=query or source,
-            actual_output=output,
-            retrieval_context=[source],
-            expected_output=expected_output
+            input=query or "",  # user question
+            actual_output=output,  # model response
+            retrieval_context=retrieval_ctx,  # RAG/context
+            expected_output=expected_output  # may be None for some metrics
         )
     
     def evaluate_faithfulness(self, test_case) -> tuple[float, str]:
-        """Evaluate faithfulness metric with strict mode enabled."""
+        """Evaluate faithfulness metric with strict mode enabled.
+        
+        TODO(copilot): Keep strict_mode=True for all metrics to penalize invented details.
+        This is important for cases like:
+        query="write selenium code" but output mentions "Salesforce login".
+        Faithfulness should go down in such cases.
+        """
         from deepeval.metrics.faithfulness.faithfulness import FaithfulnessMetric
         
         # Enable strict_mode for more rigorous evaluation
@@ -267,14 +289,60 @@ class MetricEvaluator:
         explanation = f"Contextual Recall (strict mode) measures how well the context covers the expected answer. Score: {score}/1.0"
         return score, explanation
     
-    def evaluate(self, metric_name: str, source: str, output: str, query: Optional[str] = None, expected_output: Optional[str] = None) -> tuple[float, str]:
-        """Main evaluation method that routes to specific metric evaluators."""
+    def evaluate(
+        self,
+        metric_name: str,
+        *,
+        query: Optional[str] = None,
+        context: Optional[List[str]] = None,
+        output: str,
+        expected_output: Optional[str] = None
+    ) -> tuple[float, str]:
+        """Main evaluation method that routes to specific metric evaluators.
+        
+        This method uses keyword-only arguments for better testability and clarity.
+        
+        TODO(copilot): Add metric-specific validation before calling deepeval.
+        - faithfulness, answer_relevancy: query + output are enough (context recommended)
+        - contextual_precision, contextual_recall: MUST have expected_output AND context
+        
+        Args:
+            metric_name: Which metric to evaluate
+            query: User's question or input (optional for most metrics)
+            context: List of retrieved documents or source passages (optional for some metrics)
+            output: Model's generated response (required)
+            expected_output: Reference answer (required for contextual_* metrics)
+            
+        Returns:
+            Tuple of (score, explanation)
+            
+        Raises:
+            ValueError: If metric is unsupported or required fields are missing
+        """
         metric_name = metric_name.lower()
         
         if not self.validate_metric(metric_name):
             raise ValueError(f"Unsupported metric: {metric_name}. Supported: {list(self.SUPPORTED_METRICS.keys())}")
         
-        test_case = self.create_test_case(source, output, query, expected_output)
+        # Validate metric-specific requirements
+        if metric_name in ["contextual_precision", "contextual_recall"]:
+            # These metrics compare context vs expected answer
+            if not expected_output:
+                raise ValueError(f"{metric_name} requires 'expected_output' field")
+            if not context:
+                raise ValueError(f"{metric_name} requires 'context' field (list of retrieved passages)")
+        
+        if metric_name == "answer_relevancy":
+            if not query:
+                raise ValueError("answer_relevancy requires 'query' field (the user's question)")
+        
+        # Create test case with proper structure
+        test_case = self.create_test_case(
+            query=query,
+            context=context,
+            output=output,
+            expected_output=expected_output
+        )
         
         # Route to appropriate evaluation method
         if metric_name == "faithfulness":
@@ -289,84 +357,109 @@ class MetricEvaluator:
             raise ValueError(f"Metric {metric_name} is not implemented yet")
 
 
+def init_evaluator_from_env() -> MetricEvaluator:
+    """Initialize MetricEvaluator from environment variables.
+    
+    Returns:
+        Configured MetricEvaluator instance
+        
+    Raises:
+        ValueError: If required API keys are missing
+    """
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    eval_model = os.getenv("EVAL_MODEL", "llama-3.3-70b-versatile")
+    
+    # Determine which API to use based on EVAL_MODEL
+    # Groq models: llama-*, mixtral-*, gemma*, qwen*
+    # OpenAI models: gpt-*
+    use_groq = any(eval_model.startswith(prefix) for prefix in ["llama-", "mixtral-", "gemma", "qwen"])
+    
+    if use_groq:
+        if not groq_api_key:
+            raise ValueError("GROQ_API_KEY environment variable is required when using Groq models")
+        
+        logger.info(f"Using Groq API for evaluation with model: {eval_model}")
+        return MetricEvaluator(
+            api_key=groq_api_key,
+            model_name=eval_model,
+            use_groq=True
+        )
+    else:
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY environment variable is required when using OpenAI models")
+        
+        # Override model if not a valid GPT model
+        actual_model = eval_model if eval_model.startswith("gpt-") else "gpt-4o-mini"
+        if actual_model != eval_model:
+            logger.warning(f"EVAL_MODEL '{eval_model}' is not a valid GPT model, using '{actual_model}' instead")
+        
+        logger.info(f"Using OpenAI API for evaluation with model: {actual_model}")
+        return MetricEvaluator(
+            api_key=openai_api_key,
+            model_name=actual_model,
+            use_groq=False
+        )
+
+
 @app.post("/eval", response_model=EvalResponse)
 async def evaluate_llm_response(req: EvalRequest):
     """
     Evaluate an LLM response using the specified metric.
     
+    TODO(copilot): In the /eval endpoint, detect provider/model once, then pass the *whole request*
+    to MetricEvaluator so it can use query/context/output together.
+    
     This enterprise-grade evaluation system supports multiple metrics for training purposes.
     Each metric can be used independently to teach specific evaluation concepts.
     
     Args:
-        req: EvalRequest with source (context), output (response), metric type, and optional provider
+        req: EvalRequest with query, context, output, metric type, and optional provider
         
     Returns:
         EvalResponse with metric score and explanation
     """
     try:
-        # Validate inputs
-        if not req.source or not req.output:
-            raise ValueError("Source and output cannot be empty")
+        # Validate minimal fields
+        if not req.output:
+            raise HTTPException(status_code=400, detail="output field is required")
         
-        if not req.metric:
-            req.metric = "faithfulness"  # Default metric
+        metric_name = req.metric or "faithfulness"
             
-        logger.info(f"Evaluating metric: {req.metric}")
-        logger.info(f"Source length: {len(req.source)}")
+        logger.info(f"Evaluating metric: {metric_name}")
+        logger.info(f"Query: {req.query[:100] if req.query else 'None'}...")
+        logger.info(f"Context items: {len(req.context) if req.context else 0}")
         logger.info(f"Output length: {len(req.output)}")
         
-        # Initialize evaluator with Groq (or fallback to OpenAI if configured)
-        groq_api_key = os.getenv("GROQ_API_KEY")
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        eval_model = os.getenv("EVAL_MODEL", "llama-3.3-70b-versatile")
+        # Initialize evaluator from environment
+        evaluator = init_evaluator_from_env()
         
-        # Determine which API to use based on EVAL_MODEL
-        # Groq models: llama-*, mixtral-*, gemma2-*, qwen*
-        # OpenAI models: gpt-*
-        use_groq = any(eval_model.startswith(prefix) for prefix in ["llama-", "mixtral-", "gemma", "qwen"])
-        
-        if use_groq:
-            if not groq_api_key:
-                raise ValueError("GROQ_API_KEY is required when using Groq models")
-            # Use Groq API
-            evaluator = MetricEvaluator(
-                api_key=groq_api_key,
-                model_name=eval_model,
-                use_groq=True
-            )
-            logger.info(f"Using Groq API for evaluation with model: {eval_model}")
-        else:
-            if not openai_api_key:
-                raise ValueError("OPENAI_API_KEY is required when using OpenAI models")
-            # Use OpenAI API
-            evaluator = MetricEvaluator(
-                api_key=openai_api_key,
-                model_name=eval_model if eval_model.startswith("gpt-") else "gpt-4o-mini",
-                use_groq=False
-            )
-            logger.info(f"Using OpenAI API for evaluation with model: {eval_model}")
-        
-        # Perform evaluation
+        # Evaluate using keyword arguments for better testability
         score, explanation = evaluator.evaluate(
-            metric_name=req.metric,
-            source=req.source,
+            metric_name=metric_name,
+            query=req.query,
+            context=req.context,
             output=req.output,
             expected_output=req.expected_output
         )
         
-        logger.info(f"Evaluation complete. Metric: {req.metric}, Score: {score}")
+        logger.info(f"Evaluation complete. Metric: {metric_name}, Score: {score}")
         
         return EvalResponse(
-            metric_name=req.metric,
+            metric_name=metric_name,
             score=score,
             explanation=explanation
         )
-            
+    
+    except ValueError as ve:
+        # User input errors / metric misuse (missing required fields, etc.)
+        logger.warning(f"Validation error: {str(ve)}")
+        raise HTTPException(status_code=400, detail=str(ve))
+    
     except Exception as e:
-        logger.error(f"Evaluation error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        # Unexpected errors (API failures, etc.)
+        logger.exception("Evaluation error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @app.get("/health")
@@ -381,27 +474,92 @@ async def health_check():
 
 @app.get("/metrics-info")
 async def metrics_info():
-    """Get available metrics information for training purposes"""
+    """Get available metrics information for training purposes
+    
+    TODO(copilot): Update /metrics-info to describe the new required fields per metric
+    so the Node.js side knows what to send.
+    Example:
+    - faithfulness: query (opt), context (opt), output (req)
+    - answer_relevancy: query (req), output (req)
+    - contextual_precision/recall: query (opt), context (req), output (req), expected_output (req)
+    """
     metrics = []
+    
+    # Define required/optional fields per metric
+    metric_requirements = {
+        "faithfulness": {
+            "required": ["output"],
+            "recommended": ["context", "query"],
+            "optional": []
+        },
+        "answer_relevancy": {
+            "required": ["query", "output"],
+            "recommended": ["context"],
+            "optional": []
+        },
+        "contextual_precision": {
+            "required": ["context", "output", "expected_output"],
+            "recommended": ["query"],
+            "optional": []
+        },
+        "contextual_recall": {
+            "required": ["context", "output", "expected_output"],
+            "recommended": ["query"],
+            "optional": []
+        }
+    }
+    
     for metric_name, description in MetricEvaluator.SUPPORTED_METRICS.items():
+        requirements = metric_requirements.get(metric_name, {})
         metrics.append({
             "name": metric_name,
             "description": description,
             "endpoint": "/eval",
             "parameter": f'"metric": "{metric_name}"',
             "range": "0.0 to 1.0",
-            "higher_is_better": True
+            "higher_is_better": True,
+            "required_fields": requirements.get("required", []),
+            "recommended_fields": requirements.get("recommended", []),
+            "optional_fields": requirements.get("optional", [])
         })
     
     return {
         "available_metrics": metrics,
         "usage": "Include 'metric' parameter in POST /eval request body",
-        "training_note": "Each metric can be used independently for step-by-step learning",
-        "example_request": {
-            "source": "Context or retrieval content",
-            "output": "LLM generated response", 
-            "metric": "faithfulness",
-            "expected_output": "Expected or reference response (required for contextual_precision and contextual_recall)"
+        "training_note": "Each metric can be used independently for step-by-step learning. All metrics use strict_mode=True for rigorous evaluation.",
+        "request_structure": {
+            "query": "Optional[str] - The user's question or input",
+            "context": "Optional[List[str]] - List of retrieved documents or source passages",
+            "output": "str - The model's generated response to evaluate (REQUIRED)",
+            "metric": "str - Which metric to use (default: faithfulness)",
+            "expected_output": "Optional[str] - Reference answer (required for contextual_* metrics)"
+        },
+        "example_requests": {
+            "faithfulness": {
+                "query": "What is Selenium?",
+                "context": ["Selenium is a web automation framework for testing."],
+                "output": "Selenium is used for web testing",
+                "metric": "faithfulness"
+            },
+            "answer_relevancy": {
+                "query": "Can you help me write Selenium code?",
+                "output": "Yes, here is a basic example: driver.get('https://example.com')",
+                "metric": "answer_relevancy"
+            },
+            "contextual_precision": {
+                "query": "What is Selenium used for?",
+                "context": ["Selenium is for web testing", "Python is a programming language"],
+                "output": "Selenium is for web automation testing",
+                "expected_output": "Selenium is used for web testing",
+                "metric": "contextual_precision"
+            },
+            "contextual_recall": {
+                "query": "What is Selenium used for?",
+                "context": ["Selenium is a web automation framework", "It supports multiple browsers"],
+                "output": "Selenium is for web automation and testing across browsers",
+                "expected_output": "Selenium is used for web automation testing",
+                "metric": "contextual_recall"
+            }
         }
     }
 
