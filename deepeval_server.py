@@ -15,10 +15,12 @@ Usage:
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import logging
 import os
+import json
 from dotenv import load_dotenv
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +28,9 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Import DeepEval base class
+from deepeval.models.base_model import DeepEvalBaseLLM
 
 app = FastAPI(
     title="Deepeval Evaluation Service",
@@ -60,26 +65,135 @@ class EvalResponse(BaseModel):
     error: Optional[str] = None
 
 
+class GroqModel(DeepEvalBaseLLM):
+    """Custom Groq model wrapper for DeepEval compatibility."""
+    
+    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
+        """Initialize Groq client.
+        
+        Available Groq models:
+        - llama-3.3-70b-versatile (recommended, fast and capable)
+        - llama-3.1-70b-versatile
+        - llama-3.1-8b-instant
+        - mixtral-8x7b-32768
+        - gemma2-9b-it
+        """
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1"
+        )
+        self.model_name = model
+        logger.info(f"Initialized Groq model: {model}")
+    
+    def load_model(self):
+        """Load model - required by DeepEvalBaseLLM."""
+        return self.client
+    
+    def generate(self, prompt: str, schema: Optional[object] = None) -> str:
+        """Generate completion using Groq API.
+        
+        Args:
+            prompt: The input prompt
+            schema: Optional Pydantic model for structured output
+        
+        Returns:
+            Generated text response or JSON string if schema provided
+        """
+        try:
+            # Check if we need structured output
+            if schema:
+                # Request JSON format in the prompt
+                json_prompt = f"{prompt}\n\nRespond with valid JSON only, no other text."
+                
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that responds in JSON format."},
+                        {"role": "user", "content": json_prompt}
+                    ],
+                    temperature=0.0,
+                    response_format={"type": "json_object"}  # Enable JSON mode
+                )
+                
+                content = response.choices[0].message.content
+                
+                # Parse and validate JSON against schema if it's a Pydantic model
+                try:
+                    json_data = json.loads(content)
+                    # If schema is a Pydantic model, validate and return instance
+                    if hasattr(schema, 'model_validate'):
+                        return schema.model_validate(json_data)
+                    return content
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse JSON response: {content}")
+                    return content
+            else:
+                # Regular text generation
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0
+                )
+                return response.choices[0].message.content
+                
+        except Exception as e:
+            logger.error(f"Groq API error: {str(e)}")
+            raise
+    
+    async def a_generate(self, prompt: str, schema: Optional[object] = None) -> str:
+        """Async generate - for DeepEval compatibility."""
+        return self.generate(prompt, schema)
+    
+    def get_model_name(self) -> str:
+        """Return model name - required by DeepEvalBaseLLM."""
+        return self.model_name
+    
+    def should_use_azure_openai(self) -> bool:
+        """Check if using Azure - required by DeepEvalBaseLLM."""
+        return False
+
+
 class MetricEvaluator:
-    """Enterprise-grade metric evaluation system for training purposes."""
+    """Enterprise-grade metric evaluation system for training purposes.
+    
+    All metrics are configured with strict_mode=True for rigorous evaluation:
+    - Faithfulness: Penalizes any claims not directly supported by context
+    - Answer Relevancy: Penalizes irrelevant or off-topic responses
+    - Contextual Precision: Ensures only highly relevant context ranks high
+    - Contextual Recall: Requires comprehensive coverage of expected information
+    """
     
     SUPPORTED_METRICS = {
-        "faithfulness": "Evaluates if the output is faithful to the source context",
-        "answer_relevancy": "Evaluates how relevant the answer is to the input question", 
-        "contextual_precision": "Evaluates the precision of retrieval in RAG systems (requires expected_output)",
-        "contextual_recall": "Evaluates the recall of retrieval in RAG systems (requires expected_output)"
+        "faithfulness": "Evaluates if the output is faithful to the source context (strict mode enabled)",
+        "answer_relevancy": "Evaluates how relevant the answer is to the input question (strict mode enabled)", 
+        "contextual_precision": "Evaluates the precision of retrieval in RAG systems (strict mode enabled, requires expected_output)",
+        "contextual_recall": "Evaluates the recall of retrieval in RAG systems (strict mode enabled, requires expected_output)"
     }
     
-    def __init__(self, openai_api_key: str, model_name: str = "gpt-4o-mini"):
-        """Initialize the evaluator with OpenAI credentials."""
-        if not openai_api_key or openai_api_key == "your-openai-api-key-here":
-            raise ValueError("Valid OPENAI_API_KEY is required")
+    def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile", use_groq: bool = False):
+        """Initialize the evaluator with API credentials.
         
-        os.environ["OPENAI_API_KEY"] = openai_api_key
+        Args:
+            api_key: API key for the LLM provider (OpenAI or Groq)
+            model_name: Model to use for evaluation
+            use_groq: Whether to use Groq API instead of OpenAI
+        """
+        if not api_key or api_key == "your-openai-api-key-here" or api_key == "your-groq-api-key-here":
+            raise ValueError("Valid API key is required")
         
-        from deepeval.models import GPTModel
-        self.model = GPTModel(model=model_name)
         self.model_name = model_name
+        self.use_groq = use_groq
+        
+        if use_groq:
+            # Use custom Groq model
+            logger.info(f"Using Groq API with model: {model_name}")
+            self.model = GroqModel(api_key=api_key, model=model_name)
+        else:
+            # Standard OpenAI
+            os.environ["OPENAI_API_KEY"] = api_key
+            logger.info(f"Using OpenAI API with model: {model_name}")
+            from deepeval.models import GPTModel
+            self.model = GPTModel(model=model_name)
     
     def validate_metric(self, metric_name: str) -> bool:
         """Validate if the requested metric is supported."""
@@ -102,51 +216,55 @@ class MetricEvaluator:
         )
     
     def evaluate_faithfulness(self, test_case) -> tuple[float, str]:
-        """Evaluate faithfulness metric."""
+        """Evaluate faithfulness metric with strict mode enabled."""
         from deepeval.metrics.faithfulness.faithfulness import FaithfulnessMetric
         
-        metric = FaithfulnessMetric(model=self.model)
+        # Enable strict_mode for more rigorous evaluation
+        metric = FaithfulnessMetric(model=self.model, strict_mode=True)
         score = metric.measure(test_case)
         
-        explanation = f"Faithfulness measures how well the output aligns with the provided context. Score: {score}/1.0"
+        explanation = f"Faithfulness (strict mode) measures how well the output aligns with the provided context. Score: {score}/1.0. Strict mode penalizes any claims not directly supported by context."
         return score, explanation
     
     def evaluate_answer_relevancy(self, test_case) -> tuple[float, str]:
-        """Evaluate answer relevancy metric.""" 
+        """Evaluate answer relevancy metric with strict mode enabled.""" 
         from deepeval.metrics.answer_relevancy.answer_relevancy import AnswerRelevancyMetric
         
-        metric = AnswerRelevancyMetric(model=self.model)
+        # Enable strict_mode for more rigorous evaluation
+        metric = AnswerRelevancyMetric(model=self.model, strict_mode=True)
         score = metric.measure(test_case)
         
-        explanation = f"Answer Relevancy measures how well the output addresses the input question. Score: {score}/1.0"
+        explanation = f"Answer Relevancy (strict mode) measures how well the output addresses the input question. Score: {score}/1.0. Strict mode penalizes irrelevant or off-topic responses."
         return score, explanation
     
     def evaluate_contextual_precision(self, test_case) -> tuple[float, str]:
-        """Evaluate contextual precision metric."""
+        """Evaluate contextual precision metric with strict mode enabled."""
         from deepeval.metrics.contextual_precision.contextual_precision import ContextualPrecisionMetric
         
         # Validate that required parameters are present
         if test_case.expected_output is None:
             raise ValueError("Contextual Precision metric requires an expected_output to compare against")
         
-        metric = ContextualPrecisionMetric(model=self.model)
+        # Enable strict_mode for more rigorous evaluation
+        metric = ContextualPrecisionMetric(model=self.model, strict_mode=True)
         score = metric.measure(test_case)
         
-        explanation = f"Contextual Precision measures how precise the retrieved context is for generating the expected output. Score: {score}/1.0"
+        explanation = f"Contextual Precision (strict mode) measures how precise the retrieved context is for generating the expected output. Score: {score}/1.0"
         return score, explanation
     
     def evaluate_contextual_recall(self, test_case) -> tuple[float, str]:
-        """Evaluate contextual recall metric."""
+        """Evaluate contextual recall metric with strict mode enabled."""
         from deepeval.metrics.contextual_recall.contextual_recall import ContextualRecallMetric
         
         # Validate that required parameters are present
         if test_case.expected_output is None:
             raise ValueError("Contextual Recall metric requires an expected_output to compare against")
         
-        metric = ContextualRecallMetric(model=self.model)
+        # Enable strict_mode for more rigorous evaluation
+        metric = ContextualRecallMetric(model=self.model, strict_mode=True)
         score = metric.measure(test_case)
         
-        explanation = f"Contextual Recall measures how well the context covers the expected answer. Score: {score}/1.0"
+        explanation = f"Contextual Recall (strict mode) measures how well the context covers the expected answer. Score: {score}/1.0"
         return score, explanation
     
     def evaluate(self, metric_name: str, source: str, output: str, query: Optional[str] = None, expected_output: Optional[str] = None) -> tuple[float, str]:
@@ -197,13 +315,36 @@ async def evaluate_llm_response(req: EvalRequest):
         logger.info(f"Source length: {len(req.source)}")
         logger.info(f"Output length: {len(req.output)}")
         
-        # Initialize evaluator
+        # Initialize evaluator with Groq (or fallback to OpenAI if configured)
+        groq_api_key = os.getenv("GROQ_API_KEY")
         openai_api_key = os.getenv("OPENAI_API_KEY")
-        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        eval_model = os.getenv("EVAL_MODEL", "llama-3.3-70b-versatile")
         
-        evaluator = MetricEvaluator(openai_api_key, openai_model)
+        # Determine which API to use based on EVAL_MODEL
+        # Groq models: llama-*, mixtral-*, gemma2-*, qwen*
+        # OpenAI models: gpt-*
+        use_groq = any(eval_model.startswith(prefix) for prefix in ["llama-", "mixtral-", "gemma", "qwen"])
         
-        logger.info(f"Using evaluation model: {openai_model}")
+        if use_groq:
+            if not groq_api_key:
+                raise ValueError("GROQ_API_KEY is required when using Groq models")
+            # Use Groq API
+            evaluator = MetricEvaluator(
+                api_key=groq_api_key,
+                model_name=eval_model,
+                use_groq=True
+            )
+            logger.info(f"Using Groq API for evaluation with model: {eval_model}")
+        else:
+            if not openai_api_key:
+                raise ValueError("OPENAI_API_KEY is required when using OpenAI models")
+            # Use OpenAI API
+            evaluator = MetricEvaluator(
+                api_key=openai_api_key,
+                model_name=eval_model if eval_model.startswith("gpt-") else "gpt-4o-mini",
+                use_groq=False
+            )
+            logger.info(f"Using OpenAI API for evaluation with model: {eval_model}")
         
         # Perform evaluation
         score, explanation = evaluator.evaluate(

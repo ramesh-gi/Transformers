@@ -22,7 +22,7 @@ const asyncHandler =
  * Request body:
  * {
  *   prompt: string (required),
- *   model?: string (optional, defaults to gpt-4o-mini),
+ *   model?: string (optional, defaults to llama-3.3-70b-versatile),
  *   temperature?: number (optional, defaults to 0.7),
  *   metric?: string (optional, defaults to 'faithfulness')
  * }
@@ -56,7 +56,7 @@ router.post(
     }
 
     // Determine effective parameters
-    const effectiveModel = model || "gpt-4o-mini";
+    const effectiveModel = model || "llama-3.3-70b-versatile";
     const effectiveTemperature = temperature !== undefined ? temperature : 0.7;
     const effectiveMetric = metric || "faithfulness";
 
@@ -64,15 +64,19 @@ router.post(
     const llmResponse = await callLLM(prompt, effectiveModel, effectiveTemperature);
     console.log("LLM Response:", llmResponse);
 
+    // Determine provider based on model
+    const provider = effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") || 
+                     effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen") ? "groq" : "openai";
+
     // Evaluate with Deepeval using specified metric
-    const evalResult = await evalWithMetric(prompt, llmResponse, effectiveMetric, "openai");
+    const evalResult = await evalWithMetric(prompt, llmResponse, effectiveMetric, provider);
     console.log("Evaluation Result:", evalResult);
 
     res.json({
       prompt,
       model: effectiveModel,
       temperature: effectiveTemperature,
-      provider: "openai",
+      provider,
       llmResponse,
       evaluation: {
         metric: evalResult.metric_name,
@@ -90,7 +94,7 @@ router.post(
  * Request body:
  * {
  *   query: string (required),
- *   model?: string (optional, defaults to gpt-4o-mini),
+ *   model?: string (optional, defaults to llama-3.3-70b-versatile),
  *   temperature?: number (optional, defaults to 0.7),
  *   metric?: string (optional, defaults to 'faithfulness')
  * }
@@ -124,7 +128,7 @@ router.post(
     }
 
     // Determine effective parameters
-    const effectiveModel = model || "gpt-4o-mini";
+    const effectiveModel = model || "llama-3.3-70b-versatile";
     const effectiveTemperature = temperature !== undefined ? temperature : 0.7;
     const effectiveMetric = metric || "faithfulness";
 
@@ -145,8 +149,12 @@ ANSWER:`;
     // 3. Call LLM with RAG prompt
     const llmResponse = await callLLM(ragPrompt, effectiveModel, effectiveTemperature);
 
+    // Determine provider based on model
+    const provider = effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") || 
+                     effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen") ? "groq" : "openai";
+
     // 4. Evaluate using specified metric: source = context, output = llmResponse
-    const evalResult = await evalWithMetric(context, llmResponse, effectiveMetric, "openai");
+    const evalResult = await evalWithMetric(context, llmResponse, effectiveMetric, provider);
 
     res.json({
       query,
@@ -154,6 +162,7 @@ ANSWER:`;
       prompt: ragPrompt,
       model: effectiveModel,
       temperature: effectiveTemperature,
+      provider,
       llmResponse,
       evaluation: {
         metric: evalResult.metric_name,
@@ -223,7 +232,8 @@ router.post(
     console.log(`Source: ${source}`);
 
     // Evaluate using specified metric (no LLM generation needed)
-    const evalResult = await evalWithMetric(source, output, effectiveMetric, "openai");
+    // Default to groq provider for evaluation
+    const evalResult = await evalWithMetric(source, output, effectiveMetric, "groq");
 
     const response: any = {
       query,
