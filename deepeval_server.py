@@ -426,10 +426,12 @@ async def evaluate_llm_response(req: EvalRequest):
         
         metric_name = req.metric or "faithfulness"
             
-        logger.info(f"Evaluating metric: {metric_name}")
-        logger.info(f"Query: {req.query[:100] if req.query else 'None'}...")
+        logger.info(f"=== Evaluation Request ===")
+        logger.info(f"Metric: {metric_name}")
+        logger.info(f"Query: {req.query[:100] + '...' if req.query and len(req.query) > 100 else req.query or 'None'}")
         logger.info(f"Context items: {len(req.context) if req.context else 0}")
         logger.info(f"Output length: {len(req.output)}")
+        logger.info(f"Expected output: {'provided' if req.expected_output else 'None'}")
         
         # Initialize evaluator from environment
         evaluator = init_evaluator_from_env()
@@ -454,12 +456,14 @@ async def evaluate_llm_response(req: EvalRequest):
     except ValueError as ve:
         # User input errors / metric misuse (missing required fields, etc.)
         logger.warning(f"Validation error: {str(ve)}")
-        raise HTTPException(status_code=400, detail=str(ve))
+        # Include metric name in error for better debugging
+        raise HTTPException(status_code=400, detail=f"{metric_name}: {str(ve)}")
     
     except Exception as e:
         # Unexpected errors (API failures, etc.)
         logger.exception("Evaluation error")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        # Keep error message generic for security, details are in logs
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/health")
