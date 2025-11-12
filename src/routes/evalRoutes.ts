@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { callLLM } from "../services/llmClient.js";
-import { evalWithMetric, evalFaithfulness } from "../services/evalClient.js";
+import { evalWithMetric, evalWithFields, evalFaithfulness } from "../services/evalClient.js";
 import { retrieveContext } from "../services/ragService.js";
 import { ENV } from "../config/env.js";
 
@@ -24,7 +24,7 @@ const asyncHandler =
  *   prompt: string (required),
  *   model?: string (optional, defaults to llama-3.3-70b-versatile),
  *   temperature?: number (optional, defaults to 0.7),
- *   metric?: string (optional, defaults to 'faithfulness')
+ *   metric?: string (optional, defaults to 'answer_relevancy')
  * }
  *
  * Response:
@@ -33,7 +33,7 @@ const asyncHandler =
  *   model: string,
  *   provider: string,
  *   llmResponse: string,
- *   metrics: { faithfulness?: number }
+ *   evaluation: { metric, score, explanation }
  * }
  */
 router.post(
@@ -58,7 +58,7 @@ router.post(
     // Determine effective parameters
     const effectiveModel = model || "llama-3.3-70b-versatile";
     const effectiveTemperature = temperature !== undefined ? temperature : 0.7;
-    const effectiveMetric = metric || "faithfulness";
+    const effectiveMetric = metric || "answer_relevancy"; // Changed default from faithfulness
 
     // Call LLM
     const llmResponse = await callLLM(prompt, effectiveModel, effectiveTemperature);
@@ -68,8 +68,15 @@ router.post(
     const provider = effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") || 
                      effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen") ? "groq" : "openai";
 
-    // Evaluate with Deepeval using specified metric
-    const evalResult = await evalWithMetric(prompt, llmResponse, effectiveMetric, provider);
+    // Evaluate with DeepEval using specified metric
+    // For LLM-only (no RAG), answer_relevancy makes most sense
+    // query = prompt, output = llmResponse
+    const evalResult = await evalWithFields({
+      query: prompt,
+      output: llmResponse,
+      metric: effectiveMetric,
+      provider
+    });
     console.log("Evaluation Result:", evalResult);
 
     res.json({
@@ -105,7 +112,7 @@ router.post(
  *   context: string,
  *   prompt: string,
  *   llmResponse: string,
- *   metrics: { faithfulness?: number }
+ *   evaluation: { metric, score, explanation }
  * }
  */
 router.post(
@@ -133,13 +140,13 @@ router.post(
     const effectiveMetric = metric || "faithfulness";
 
     // 1. Retrieve context from RAG
-    const context = await retrieveContext(query);
+    const contextStr = await retrieveContext(query);
 
     // 2. Build RAG prompt
     const ragPrompt = `You are a helpful QA assistant. Using ONLY the following context, answer the question as accurately as possible. If the context does not contain the answer, say "I don't have enough information to answer that."
 
 CONTEXT:
-${context}
+${contextStr}
 
 QUESTION:
 ${query}
@@ -153,12 +160,18 @@ ANSWER:`;
     const provider = effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") || 
                      effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen") ? "groq" : "openai";
 
-    // 4. Evaluate using specified metric: source = context, output = llmResponse
-    const evalResult = await evalWithMetric(context, llmResponse, effectiveMetric, provider);
+    // 4. Evaluate using specified metric
+    // For RAG, we have context (as array) and output
+    const evalResult = await evalWithFields({
+      context: [contextStr], // Convert string to array
+      output: llmResponse,
+      metric: effectiveMetric,
+      provider
+    });
 
     res.json({
       query,
-      context,
+      context: contextStr,
       prompt: ragPrompt,
       model: effectiveModel,
       temperature: effectiveTemperature,
@@ -190,53 +203,68 @@ router.get("/health", (req: Request, res: Response) => {
  * 
  * Request body:
  * {
- *   query: string (required) - the input question/prompt,
+ *   query?: string - the input question (required for answer_relevancy),
  *   output: string (required) - the response to evaluate,
- *   context?: string (optional) - context for faithfulness evaluation,
- *   metric?: string (optional, defaults to 'faithfulness')
+ *   context?: string | string[] - context for faithfulness evaluation,
+ *   expected_output?: string - reference answer (for contextual_* metrics),
+ *   metric?: string (optional, defaults to 'answer_relevancy')
  * }
  *
  * Response:
  * {
- *   query: string,
+ *   query?: string,
  *   output: string,
- *   context?: string,
+ *   context?: string[],
+ *   expected_output?: string,
  *   evaluation: { metric, score, explanation }
  * }
  */
 router.post(
   "/eval-only",
   asyncHandler(async (req: Request, res: Response) => {
-    const { query, output, context, metric } = req.body;
+    const { query, output, context, expected_output, metric } = req.body;
 
     // Validation
-    if (!query) {
-      return res.status(400).json({
-        error: "Missing required field: query"
-      });
-    }
-
     if (!output) {
       return res.status(400).json({
         error: "Missing required field: output"
       });
     }
 
-    // Determine effective parameters
-    const effectiveMetric = metric || "faithfulness";
-    const source = context || query; // Use context if provided, otherwise use query as source
+    // Determine effective metric
+    const effectiveMetric = metric || "answer_relevancy";
+
+    // Build evaluation parameters based on what's provided
+    const evalParams: any = {
+      output,
+      metric: effectiveMetric,
+      provider: "groq"
+    };
+
+    // Add query if provided
+    if (query) {
+      evalParams.query = query;
+    }
+
+    // Add context if provided (convert string to array if needed)
+    if (context) {
+      evalParams.context = Array.isArray(context) ? context : [context];
+    }
+
+    // Add expected_output if provided
+    if (expected_output) {
+      evalParams.expected_output = expected_output;
+    }
 
     console.log(`Direct evaluation - Metric: ${effectiveMetric}`);
-    console.log(`Query: ${query}`);
-    console.log(`Output: ${output}`);
-    console.log(`Source: ${source}`);
+    if (query) console.log(`Query: ${query}`);
+    if (context) console.log(`Context: ${Array.isArray(context) ? context.length + ' items' : context.substring(0, 100) + '...'}`);
+    console.log(`Output: ${output.substring(0, 100)}...`);
 
     // Evaluate using specified metric (no LLM generation needed)
-    // Default to groq provider for evaluation
-    const evalResult = await evalWithMetric(source, output, effectiveMetric, "groq");
+    const evalResult = await evalWithFields(evalParams);
 
     const response: any = {
-      query,
       output,
       evaluation: {
         metric: evalResult.metric_name,
@@ -245,10 +273,10 @@ router.post(
       }
     };
 
-    // Include context in response if it was provided
-    if (context) {
-      response.context = context;
-    }
+    // Include optional fields in response if they were provided
+    if (query) response.query = query;
+    if (context) response.context = evalParams.context;
+    if (expected_output) response.expected_output = expected_output;
 
     res.json(response);
   })
