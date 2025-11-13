@@ -1,8 +1,17 @@
 import axios from "axios";
 import { ENV } from "../config/env.js";
 
-export interface EvalResult {
+export interface MetricResult {
   metric_name: string;
+  score?: number;
+  explanation?: string;
+  error?: string;
+}
+
+export interface EvalResult {
+  results: MetricResult[];  // New: array of metric results
+  // Legacy fields for backward compatibility
+  metric_name?: string;
   score?: number;
   explanation?: string;
   error?: string;
@@ -90,15 +99,31 @@ export async function evalWithMetric(
 export async function evalWithFields(params: {
   query?: string;
   context?: string[];
-  output: string;
+  output?: string;
   metric?: string;
   expected_output?: string;
   provider?: string;
+  messages?: Array<{ role: string; content: string }>;
 }): Promise<EvalResult> {
   const payload: any = {
-    output: params.output,
     metric: params.metric || "faithfulness",
   };
+
+  // For conversation_completeness, output is optional but messages is required
+  if (params.metric === "conversation_completeness") {
+    if (!params.messages) {
+      throw new Error("messages field is required for conversation_completeness metric");
+    }
+    payload.messages = params.messages;
+    // output is still required by the API, provide a default if not given
+    payload.output = params.output || "Conversation evaluation";
+  } else {
+    // For other metrics, output is required
+    if (!params.output) {
+      throw new Error("output field is required");
+    }
+    payload.output = params.output;
+  }
 
   if (params.query) payload.query = params.query;
   if (params.context) payload.context = params.context;

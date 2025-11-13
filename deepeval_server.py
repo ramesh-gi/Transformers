@@ -15,7 +15,7 @@ Usage:
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Union
 import logging
 import os
 from dotenv import load_dotenv
@@ -54,15 +54,26 @@ class EvalRequest(BaseModel):
     """
     query: Optional[str] = None  # what the user asked
     context: Optional[List[str]] = None  # list of retrieved docs or source passages
-    output: str  # model's answer to be evaluated (REQUIRED)
+    output: Optional[str] = None  # model's answer to be evaluated (REQUIRED for most metrics, not for conversation_completeness)
     provider: Optional[str] = None  # LLM provider: 'groq' or 'openai'
-    metric: Optional[str] = "faithfulness"  # metric to evaluate
+    metric: Optional[Union[str, List[str]]] = "faithfulness"  # metric(s) to evaluate - string, array, or "all"
     expected_output: Optional[str] = None  # required for contextual_* metrics
+    messages: Optional[List[dict]] = None  # for conversation_completeness: list of {role, content}
+
+
+class MetricResult(BaseModel):
+    """Individual metric evaluation result"""
+    metric_name: str
+    score: Optional[float] = None
+    explanation: Optional[str] = None
+    error: Optional[str] = None
 
 
 class EvalResponse(BaseModel):
     """Response with evaluation metrics"""
-    metric_name: str
+    results: List[MetricResult]  # Array of metric results
+    # Legacy fields for backward compatibility (when single metric)
+    metric_name: Optional[str] = None
     score: Optional[float] = None
     explanation: Optional[str] = None
     error: Optional[str] = None
@@ -171,7 +182,9 @@ class MetricEvaluator:
         "faithfulness": "Evaluates if the output is faithful to the source context (hybrid: LLM judgment + hallucination detection)",
         "answer_relevancy": "Evaluates how relevant the answer is to the input question (hybrid: LLM judgment + definition enforcement)", 
         "contextual_precision": "Evaluates the precision of retrieval in RAG systems (natural LLM judgment, requires expected_output)",
-        "contextual_recall": "Evaluates the recall of retrieval in RAG systems (natural LLM judgment, requires expected_output)"
+        "contextual_recall": "Evaluates the recall of retrieval in RAG systems (natural LLM judgment, requires expected_output)",
+        "conversation_completeness": "Evaluates if a conversation covers all necessary topics (requires conversational context)",
+        "hallucination": "Detects hallucinations in LLM output compared to context (lower is better, 0 = no hallucinations)"
     }
     
     def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile", use_groq: bool = False):
@@ -208,13 +221,31 @@ class MetricEvaluator:
         query: Optional[str],
         context: Optional[List[str]],
         output: str,
-        expected_output: Optional[str]
+        expected_output: Optional[str],
+        messages: Optional[List[dict]] = None
     ):
         """Create a standardized test case for evaluation.
         
         Note: expected_output is kept as None unless explicitly provided to avoid
         automatic pass scenarios where metrics would compare output against itself.
+        
+        For conversation_completeness, pass messages list to create ConversationalTestCase.
         """
+        # Handle conversational test case
+        if messages is not None:
+            from deepeval.test_case import ConversationalTestCase
+            
+            # Convert messages to list of dictionaries with role and content
+            turns = []
+            for msg in messages:
+                turns.append({
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", "")
+                })
+            
+            return ConversationalTestCase(turns=turns)
+        
+        # Standard LLMTestCase for other metrics (UNCHANGED - this is the existing code)
         from deepeval.test_case import LLMTestCase
         
         # Ensure context is always a list for deepeval
@@ -228,129 +259,128 @@ class MetricEvaluator:
         )
     
     def evaluate_faithfulness(self, test_case) -> tuple[float, str]:
-        """Evaluate faithfulness with custom post-processing for hallucination detection.
-        
-        Applies additional checks to detect when output introduces entities not in context.
+        """
+        Pure DeepEval faithfulness:
+        - Uses truths/claims/verdicts from deepeval only.
+        - No additional post-processing, thresholds, or penalties.
         """
         from deepeval.metrics.faithfulness.faithfulness import FaithfulnessMetric
-        
-        # Custom metric class with post-processing for hallucination detection
-        class StricterFaithfulnessMetric(FaithfulnessMetric):
-            def measure(self, test_case, *args, **kwargs) -> float:
-                # Run the normal DeepEval pipeline first
-                base_score = super().measure(test_case, *args, **kwargs)
-                
-                output = (test_case.actual_output or "").lower()
-                context_text = " ".join(test_case.retrieval_context or []).lower()
-                
-                # Known entities/products that indicate potential hallucinations
-                suspicious_terms = [
-                    "salesforce", "sap", "oracle", "microsoft", "google",
-                    "crm", "erp", "azure", "aws", "cloud platform"
-                ]
-                
-                # Check if output mentions entities not in context
-                hallucination_detected = False
-                for term in suspicious_terms:
-                    if term in output and term not in context_text:
-                        hallucination_detected = True
-                        break
-                
-                # If hallucination detected, cap the score
-                if hallucination_detected:
-                    base_score = min(base_score, 0.4)
-                
-                self.score = base_score
-                return self.score
-        
-        # Use custom metric with strict_mode=False for natural base scoring
-        metric = StricterFaithfulnessMetric(model=self.model, strict_mode=False)
-        score = metric.measure(test_case)
-        
-        explanation = f"Faithfulness measures how well the output aligns with the provided context. Score: {score}/1.0. Extra checks detect when output introduces entities/products not mentioned in context."
+
+        metric = FaithfulnessMetric(
+            model=self.model,              # your DeepEvalBaseLLM or model name
+            include_reason=True,           # let DeepEval generate the reason
+            async_mode=False,              # keep sync in this server
+            strict_mode=False,             # no hard clamp to 0 below threshold
+            penalize_ambiguous_claims=False
+        )
+
+        score = metric.measure(test_case)      # DeepEval computes truths/claims/verdicts internally
+        explanation = metric.reason or "Faithfulness (DeepEval core)."
         return score, explanation
-    
+
     def evaluate_answer_relevancy(self, test_case) -> tuple[float, str]:
-        """Evaluate answer relevancy with custom strictness for definition questions.
-        
-        Applies additional checks for 'what is...' questions to ensure definitional answers.
+        """
+        Pure DeepEval Answer Relevancy:
+        - Uses DeepEval's native statements/verdicts/score.
+        - No custom post-processing or caps.
         """
         from deepeval.metrics.answer_relevancy.answer_relevancy import AnswerRelevancyMetric
-        
-        # Custom metric class with post-processing for definition questions
-        class StricterAnswerRelevancyMetric(AnswerRelevancyMetric):
-            def measure(self, test_case, *args, **kwargs) -> float:
-                # Run the normal DeepEval pipeline first
-                base_score = super().measure(test_case, *args, **kwargs)
-                
-                query = (test_case.input or "").strip().lower()
-                output = (test_case.actual_output or "").strip().lower()
-                
-                # Apply stricter rules only to "what is..." questions
-                if query.startswith("what is "):
-                    term = query[len("what is ") :].strip(" .?!")
-                    
-                    # 1) Term not even mentioned → hard cap at 0.4
-                    if term and term not in output:
-                        base_score = min(base_score, 0.4)
-                    
-                    # 2) No definitional pattern → cap at 0.7
-                    definers = (" is ", " is a ", " is an ", " is the ")
-                    if not any(d in output for d in definers):
-                        base_score = min(base_score, 0.7)
-                    
-                    # 3) Very short or uncertain answers → cap at 0.3
-                    if len(output) < 20 or "don't know" in output or "not sure" in output:
-                        base_score = min(base_score, 0.3)
-                
-                self.score = base_score
-                return self.score
-        
-        # Use custom metric with strict_mode=False for natural base scoring
-        metric = StricterAnswerRelevancyMetric(model=self.model, strict_mode=False)
+
+        metric = AnswerRelevancyMetric(
+            model=self.model,        # DeepEvalBaseLLM or model name already init'd
+            include_reason=True,     # let DeepEval generate the reason
+            async_mode=False,        # keep server synchronous
+            strict_mode=False        # no threshold clamp
+        )
+
         score = metric.measure(test_case)
-        
-        explanation = f"Answer Relevancy measures how well the output addresses the input question. Score: {score}/1.0. Extra checks applied for definition-style questions (e.g., 'What is X?' requires mentioning X and using definitional language)."
+        explanation = metric.reason or "Answer Relevancy (DeepEval core)."
         return score, explanation
-    
+
     def evaluate_contextual_precision(self, test_case) -> tuple[float, str]:
-        """Evaluate contextual precision metric with natural model evaluation."""
+        """
+        Pure DeepEval Contextual Precision:
+        - Requires: input, expected_output, retrieval_context
+        - No post-processing; returns DeepEval's score and reason.
+        """
         from deepeval.metrics.contextual_precision.contextual_precision import ContextualPrecisionMetric
-        
-        # Validate that required parameters are present
-        if test_case.expected_output is None:
-            raise ValueError("Contextual Precision metric requires an expected_output to compare against")
-        
-        # Use strict_mode=False for more variety and nuanced scoring
-        metric = ContextualPrecisionMetric(model=self.model, strict_mode=False)
+
+        metric = ContextualPrecisionMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False,
+        )
         score = metric.measure(test_case)
-        
-        explanation = f"Contextual Precision measures how precise the retrieved context is for generating the expected output. Score: {score}/1.0. Model naturally evaluates precision with nuanced judgment."
+        explanation = metric.reason or "Contextual Precision (DeepEval core)."
         return score, explanation
-    
+
     def evaluate_contextual_recall(self, test_case) -> tuple[float, str]:
-        """Evaluate contextual recall metric with natural model evaluation."""
+        """Pure DeepEval Contextual Recall (no post-processing)."""
         from deepeval.metrics.contextual_recall.contextual_recall import ContextualRecallMetric
-        
-        # Validate that required parameters are present
-        if test_case.expected_output is None:
-            raise ValueError("Contextual Recall metric requires an expected_output to compare against")
-        
-        # Use strict_mode=False for more variety and nuanced scoring
-        metric = ContextualRecallMetric(model=self.model, strict_mode=False)
+
+        metric = ContextualRecallMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False,
+        )
         score = metric.measure(test_case)
-        
-        explanation = f"Contextual Recall measures how well the context covers the expected answer. Score: {score}/1.0. Model naturally evaluates recall with nuanced judgment."
+        return score, (metric.reason or "Contextual Recall (DeepEval core).")
+
+    def evaluate_conversation_completeness(self, conv_case) -> tuple[float, str]:
+        """Pure DeepEval Conversation Completeness (no post-processing).
+        Expects a deepeval.test_case.ConversationalTestCase.
+        """
+        from deepeval.metrics.conversation_completeness.conversation_completeness import (
+            ConversationCompletenessMetric,
+        )
+
+        metric = ConversationCompletenessMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False,
+            # window_size=3,  # optional tweak; defaults to 3
+        )
+        score = metric.measure(conv_case)
+        return score, (metric.reason or "Conversation Completeness (DeepEval core).")
+
+    def evaluate_hallucination(self, test_case) -> tuple[float, str]:
+        """
+        Pure DeepEval Hallucination (no post-processing).
+        Requires: input, actual_output, context.
+        Note: Lower is better. 0.0 = no hallucinations.
+        """
+        from deepeval.metrics.hallucination.hallucination import HallucinationMetric
+
+        metric = HallucinationMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False,
+        )
+
+        # Compatibility: some pipelines set `retrieval_context` only.
+        if getattr(test_case, "context", None) is None and getattr(test_case, "retrieval_context", None) is not None:
+            try:
+                setattr(test_case, "context", test_case.retrieval_context)
+            except Exception:
+                pass
+
+        score = metric.measure(test_case)
+        explanation = metric.reason or "Hallucination (DeepEval core; lower is better, 0 = none)."
         return score, explanation
-    
+
     def evaluate(
         self,
         metric_name: str,
         *,
         query: Optional[str] = None,
         context: Optional[List[str]] = None,
-        output: str,
-        expected_output: Optional[str] = None
+        output: str = "",
+        expected_output: Optional[str] = None,
+        messages: Optional[List[dict]] = None
     ) -> tuple[float, str]:
         """Main evaluation method that routes to specific metric evaluators.
         
@@ -359,13 +389,16 @@ class MetricEvaluator:
         - faithfulness: output required, context + query recommended
         - answer_relevancy: query + output required
         - contextual_precision/recall: context + output + expected_output required
+        - conversation_completeness: messages required (list of conversation turns)
+        - hallucination: output + context required, query recommended
         
         Args:
             metric_name: Which metric to evaluate
             query: User's question or input (optional for most metrics)
             context: List of retrieved documents or source passages (optional for some metrics)
-            output: Model's generated response (required)
+            output: Model's generated response (required for most metrics)
             expected_output: Reference answer (required for contextual_* metrics)
+            messages: List of conversation messages for conversation_completeness metric
             
         Returns:
             Tuple of (score, explanation)
@@ -390,12 +423,21 @@ class MetricEvaluator:
             if not query:
                 raise ValueError("answer_relevancy requires 'query' field (the user's question)")
         
+        if metric_name == "conversation_completeness":
+            if not messages:
+                raise ValueError("conversation_completeness requires 'messages' field (list of conversation turns with role and content)")
+        
+        if metric_name == "hallucination":
+            if not context:
+                raise ValueError("hallucination requires 'context' field (list of source passages to check against)")
+        
         # Create test case with proper structure
         test_case = self.create_test_case(
             query=query,
             context=context,
             output=output,
-            expected_output=expected_output
+            expected_output=expected_output,
+            messages=messages
         )
         
         # Route to appropriate evaluation method
@@ -407,6 +449,10 @@ class MetricEvaluator:
             return self.evaluate_contextual_precision(test_case)
         elif metric_name == "contextual_recall":
             return self.evaluate_contextual_recall(test_case)
+        elif metric_name == "conversation_completeness":
+            return self.evaluate_conversation_completeness(test_case)
+        elif metric_name == "hallucination":
+            return self.evaluate_hallucination(test_case)
         else:
             raise ValueError(f"Metric {metric_name} is not implemented yet")
 
@@ -459,61 +505,124 @@ def init_evaluator_from_env() -> MetricEvaluator:
 @app.post("/eval", response_model=EvalResponse)
 async def evaluate_llm_response(req: EvalRequest):
     """
-    Evaluate an LLM response using the specified metric.
+    Evaluate an LLM response using one or more metrics.
     
-    Enterprise-grade evaluation system with strict mode enabled for all metrics.
+    Supports:
+    - Single metric: metric="faithfulness"
+    - Multiple metrics: metric=["faithfulness", "answer_relevancy"]
+    - All metrics: metric="all"
+    
     Each metric can be used independently to teach specific evaluation concepts.
     
     Args:
-        req: EvalRequest with query, context, output, metric type, and optional provider
+        req: EvalRequest with query, context, output, metric type(s), and optional provider
         
     Returns:
-        EvalResponse with metric score and explanation
+        EvalResponse with array of metric results
     """
-    try:
-        # Validate minimal fields
-        if not req.output:
-            raise HTTPException(status_code=400, detail="output field is required")
+    # Parse metric parameter - can be string, array, or "all"
+    metric_param = req.metric or "faithfulness"
+    
+    # Convert to list of metrics
+    if isinstance(metric_param, str):
+        if metric_param.lower() == "all":
+            # Get all supported metrics except conversation_completeness if no messages
+            metrics_to_eval = list(MetricEvaluator.SUPPORTED_METRICS.keys())
+            if not req.messages and "conversation_completeness" in metrics_to_eval:
+                metrics_to_eval.remove("conversation_completeness")
+        else:
+            metrics_to_eval = [metric_param]
+    else:
+        metrics_to_eval = metric_param
+    
+    # Validate minimal fields for each metric
+    for metric_name in metrics_to_eval:
+        metric_name_lower = metric_name.lower()
         
-        metric_name = req.metric or "faithfulness"
-            
+        # For conversation_completeness, messages are required instead of output
+        if metric_name_lower == "conversation_completeness":
+            if not req.messages:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="messages field is required for conversation_completeness metric"
+                )
+        else:
+            if not req.output:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"output field is required for {metric_name_lower} metric"
+                )
+    
+    try:
         logger.info(f"=== Evaluation Request ===")
-        logger.info(f"Metric: {metric_name}")
+        logger.info(f"Metrics: {metrics_to_eval}")
         logger.info(f"Query: {req.query[:100] + '...' if req.query and len(req.query) > 100 else req.query or 'None'}")
         logger.info(f"Context items: {len(req.context) if req.context else 0}")
-        logger.info(f"Output length: {len(req.output)}")
+        logger.info(f"Output length: {len(req.output) if req.output else 0}")
         logger.info(f"Expected output: {'provided' if req.expected_output else 'None'}")
+        logger.info(f"Messages: {len(req.messages) if req.messages else 0} turns")
         
         # Initialize evaluator from environment
         evaluator = init_evaluator_from_env()
         
-        # Evaluate using keyword arguments for better testability
-        score, explanation = evaluator.evaluate(
-            metric_name=metric_name,
-            query=req.query,
-            context=req.context,
-            output=req.output,
-            expected_output=req.expected_output
-        )
+        # Evaluate each metric
+        results = []
+        for metric_name in metrics_to_eval:
+            try:
+                score, explanation = evaluator.evaluate(
+                    metric_name=metric_name,
+                    query=req.query,
+                    context=req.context,
+                    output=req.output,
+                    expected_output=req.expected_output,
+                    messages=req.messages
+                )
+                
+                results.append(MetricResult(
+                    metric_name=metric_name,
+                    score=score,
+                    explanation=explanation
+                ))
+                
+                logger.info(f"✓ {metric_name}: {score}")
+                
+            except ValueError as ve:
+                # Metric-specific validation error
+                logger.warning(f"✗ {metric_name}: {str(ve)}")
+                results.append(MetricResult(
+                    metric_name=metric_name,
+                    score=None,
+                    explanation=None,
+                    error=str(ve)
+                ))
+            except Exception as e:
+                # Unexpected error for this metric
+                logger.error(f"✗ {metric_name}: {str(e)}")
+                results.append(MetricResult(
+                    metric_name=metric_name,
+                    score=None,
+                    explanation=None,
+                    error=f"Evaluation failed: {str(e)}"
+                ))
         
-        logger.info(f"Evaluation complete. Metric: {metric_name}, Score: {score}")
+        # Build response with backward compatibility
+        response = EvalResponse(results=results)
         
-        return EvalResponse(
-            metric_name=metric_name,
-            score=score,
-            explanation=explanation
-        )
-    
-    except ValueError as ve:
-        # User input errors / metric misuse (missing required fields, etc.)
-        logger.warning(f"Validation error: {str(ve)}")
-        # Include metric name in error for better debugging
-        raise HTTPException(status_code=400, detail=f"{metric_name}: {str(ve)}")
+        # For backward compatibility: populate legacy fields with first successful result
+        # This ensures existing clients that expect metric/score/explanation still work
+        for result in results:
+            if result.score is not None:  # First successful result
+                response.metric_name = result.metric_name
+                response.score = result.score
+                response.explanation = result.explanation
+                response.error = result.error
+                break
+        
+        return response
     
     except Exception as e:
         # Unexpected errors (API failures, etc.)
         logger.exception("Evaluation error")
-        # Keep error message generic for security, details are in logs
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -608,18 +717,32 @@ async def metrics_info():
             "required": ["context", "output", "expected_output"],
             "recommended": ["query"],
             "optional": []
+        },
+        "conversation_completeness": {
+            "required": ["messages"],
+            "recommended": [],
+            "optional": ["query"]
+        },
+        "hallucination": {
+            "required": ["output", "context"],
+            "recommended": ["query"],
+            "optional": []
         }
     }
     
     for metric_name, description in MetricEvaluator.SUPPORTED_METRICS.items():
         requirements = metric_requirements.get(metric_name, {})
+        
+        # Hallucination has inverse scoring (lower is better)
+        higher_is_better = True if metric_name != "hallucination" else False
+        
         metrics.append({
             "name": metric_name,
             "description": description,
             "endpoint": "/eval",
             "parameter": f'"metric": "{metric_name}"',
             "range": "0.0 to 1.0",
-            "higher_is_better": True,
+            "higher_is_better": higher_is_better,
             "required_fields": requirements.get("required", []),
             "recommended_fields": requirements.get("recommended", []),
             "optional_fields": requirements.get("optional", [])
@@ -627,14 +750,20 @@ async def metrics_info():
     
     return {
         "available_metrics": metrics,
-        "usage": "Include 'metric' parameter in POST /eval request body",
-        "training_note": "Each metric can be used independently for step-by-step learning. Uses hybrid approach: strict_mode=False for natural LLM judgment, plus custom post-processing to catch common failures. Faithfulness detects entity hallucinations. Answer Relevancy enforces definitional answers for 'What is...' questions. OpenAI models provide naturally stricter base scoring than Groq models.",
+        "usage": "Include 'metric' parameter in POST /eval request body. Can be a string, array, or 'all'",
+        "multi_metric_support": {
+            "single": 'metric="faithfulness"',
+            "multiple": 'metric=["faithfulness", "answer_relevancy", "hallucination"]',
+            "all": 'metric="all" - evaluates all applicable metrics'
+        },
+        "training_note": "Each metric can be used independently for step-by-step learning. Uses hybrid approach: strict_mode=False for natural LLM judgment, plus custom post-processing to catch common failures. Faithfulness detects entity hallucinations. Answer Relevancy enforces definitional answers for 'What is...' questions. Hallucination metric uses lower-is-better scoring (0 = no hallucinations). OpenAI models provide naturally stricter base scoring than Groq models.",
         "request_structure": {
             "query": "Optional[str] - The user's question or input",
             "context": "Optional[List[str]] - List of retrieved documents or source passages",
-            "output": "str - The model's generated response to evaluate (REQUIRED)",
-            "metric": "str - Which metric to use (default: faithfulness)",
-            "expected_output": "Optional[str] - Reference answer (required for contextual_* metrics)"
+            "output": "str - The model's generated response to evaluate (REQUIRED for most metrics)",
+            "metric": "str | List[str] - Which metric(s) to use: single string, array of strings, or 'all' (default: faithfulness)",
+            "expected_output": "Optional[str] - Reference answer (required for contextual_* metrics)",
+            "messages": "Optional[List[dict]] - List of conversation turns with {role, content} (required for conversation_completeness)"
         },
         "example_requests": {
             "faithfulness": {
@@ -661,6 +790,34 @@ async def metrics_info():
                 "output": "Selenium is for web automation and testing across browsers",
                 "expected_output": "Selenium is used for web automation testing",
                 "metric": "contextual_recall"
+            },
+            "conversation_completeness": {
+                "messages": [
+                    {"role": "user", "content": "What is Selenium?"},
+                    {"role": "assistant", "content": "Selenium is a web automation framework."},
+                    {"role": "user", "content": "What languages does it support?"},
+                    {"role": "assistant", "content": "It supports Python, Java, JavaScript, C#, and Ruby."}
+                ],
+                "metric": "conversation_completeness"
+            },
+            "hallucination": {
+                "query": "What is Selenium?",
+                "context": ["Selenium is a web automation framework for testing web applications."],
+                "output": "Selenium is a CRM platform developed by Salesforce.",
+                "metric": "hallucination"
+            },
+            "multiple_metrics": {
+                "query": "What is Selenium?",
+                "context": ["Selenium is a web automation framework for testing."],
+                "output": "Selenium is used for web testing",
+                "metric": ["faithfulness", "answer_relevancy", "hallucination"]
+            },
+            "all_metrics": {
+                "query": "What is Selenium?",
+                "context": ["Selenium is a web automation framework for testing."],
+                "output": "Selenium is used for web testing",
+                "expected_output": "Selenium is a web automation framework",
+                "metric": "all"
             }
         }
     }

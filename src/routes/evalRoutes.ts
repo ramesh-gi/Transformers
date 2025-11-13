@@ -79,6 +79,7 @@ router.post(
     });
     console.log("Evaluation Result:", evalResult);
 
+    // Use legacy fields for backward compatibility (populated from first successful result)
     res.json({
       prompt,
       model: effectiveModel,
@@ -88,7 +89,9 @@ router.post(
       evaluation: {
         metric: evalResult.metric_name,
         score: evalResult.score,
-        explanation: evalResult.explanation
+        explanation: evalResult.explanation,
+        // Include results array if available for multi-metric support
+        ...(evalResult.results && { results: evalResult.results })
       }
     });
   })
@@ -180,7 +183,9 @@ ANSWER:`;
       evaluation: {
         metric: evalResult.metric_name,
         score: evalResult.score,
-        explanation: evalResult.explanation
+        explanation: evalResult.explanation,
+        // Include results array if available for multi-metric support
+        ...(evalResult.results && { results: evalResult.results })
       }
     });
   })
@@ -204,30 +209,32 @@ router.get("/health", (req: Request, res: Response) => {
  * Request body:
  * {
  *   query?: string - the input question (required for answer_relevancy),
- *   output: string (required) - the response to evaluate,
+ *   output?: string - the response to evaluate (required for most metrics),
  *   context?: string | string[] - context for faithfulness evaluation,
  *   expected_output?: string - reference answer (for contextual_* metrics),
+ *   messages?: Array<{role: string, content: string}> - conversation turns (required for conversation_completeness),
  *   metric?: string (optional, defaults to 'answer_relevancy')
  * }
  *
  * Response:
  * {
  *   query?: string,
- *   output: string,
+ *   output?: string,
  *   context?: string[],
  *   expected_output?: string,
+ *   messages?: Array<{role: string, content: string}>,
  *   evaluation: { metric, score, explanation }
  * }
  */
 router.post(
   "/eval-only",
   asyncHandler(async (req: Request, res: Response) => {
-    const { query, output, context, expected_output, metric } = req.body;
+    const { query, output, context, expected_output, metric, messages } = req.body;
 
     // Validation
-    if (!output) {
+    if (!output && !messages) {
       return res.status(400).json({
-        error: "Missing required field: output"
+        error: "Missing required field: output or messages (for conversation_completeness)"
       });
     }
 
@@ -236,10 +243,14 @@ router.post(
 
     // Build evaluation parameters based on what's provided
     const evalParams: any = {
-      output,
       metric: effectiveMetric,
       provider: "groq"
     };
+
+    // Add output if provided (required for most metrics)
+    if (output) {
+      evalParams.output = output;
+    }
 
     // Add query if provided
     if (query) {
@@ -256,27 +267,36 @@ router.post(
       evalParams.expected_output = expected_output;
     }
 
+    // Add messages if provided (for conversation_completeness)
+    if (messages) {
+      evalParams.messages = messages;
+    }
+
     console.log(`Direct evaluation - Metric: ${effectiveMetric}`);
     if (query) console.log(`Query: ${query}`);
     if (context) console.log(`Context: ${Array.isArray(context) ? context.length + ' items' : context.substring(0, 100) + '...'}`);
-    console.log(`Output: ${output.substring(0, 100)}...`);
+    if (output) console.log(`Output: ${output.substring(0, 100)}...`);
+    if (messages) console.log(`Messages: ${messages.length} conversation turns`);
 
     // Evaluate using specified metric (no LLM generation needed)
     const evalResult = await evalWithFields(evalParams);
 
     const response: any = {
-      output,
       evaluation: {
         metric: evalResult.metric_name,
         score: evalResult.score,
-        explanation: evalResult.explanation
+        explanation: evalResult.explanation,
+        // Include results array if available for multi-metric support
+        ...(evalResult.results && { results: evalResult.results })
       }
     };
 
     // Include optional fields in response if they were provided
+    if (output) response.output = output;
     if (query) response.query = query;
     if (context) response.context = evalParams.context;
     if (expected_output) response.expected_output = expected_output;
+    if (messages) response.messages = messages;
 
     res.json(response);
   })
